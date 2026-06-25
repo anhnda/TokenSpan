@@ -118,7 +118,12 @@ def logit_lens_probs(model, prompt_ids, answer_ids, layer_indices,
     """
     One forward pass with hidden states. For each answer token y_t and each
     selected layer L: p_L(y_t) = softmax(lm_head(norm(h_L[slot])))[y_t].
-    Returns probs: Tensor [T, len(layer_indices)] (cols ordered as layer_indices).
+
+    Returns:
+        probs:    Tensor [T, k]        p of the TARGET token per layer
+        top_p:    Tensor [T, k]        p of the argmax token per layer
+        top_id:   LongTensor [T, k]    id of the argmax token per layer
+    (cols ordered as layer_indices)
     """
     full = torch.cat([prompt_ids, answer_ids]).unsqueeze(0)
     out = model(full, output_hidden_states=True)
@@ -127,14 +132,20 @@ def logit_lens_probs(model, prompt_ids, answer_ids, layer_indices,
     T = answer_ids.numel()
     pos = torch.arange(L - 1, L - 1 + T, device=DEVICE)   # prediction slots
 
-    cols = []
+    p_cols, top_p_cols, top_id_cols = [], [], []
     for li in layer_indices:
         h = hs[li][0, pos]                       # [T, d]
         logits = lm_head(final_norm(h))          # [T, V]
         lp = F.log_softmax(logits, dim=-1)
-        p = lp.gather(1, answer_ids.unsqueeze(1)).squeeze(1).exp()  # [T]
-        cols.append(p)
-    return torch.stack(cols, dim=1)              # [T, k]
+        probs_all = lp.exp()
+        p = probs_all.gather(1, answer_ids.unsqueeze(1)).squeeze(1)  # [T]
+        top_p, top_id = probs_all.max(dim=-1)                        # [T], [T]
+        p_cols.append(p)
+        top_p_cols.append(top_p)
+        top_id_cols.append(top_id)
+    return (torch.stack(p_cols, dim=1),
+            torch.stack(top_p_cols, dim=1),
+            torch.stack(top_id_cols, dim=1))
 
 
 # ---------------------------------------------------------------------------
@@ -145,15 +156,19 @@ def decode_tok(tokenizer, tid):
     return tokenizer.decode([tid])
 
 
-def report(tokenizer, answer_ids, probs, layer_indices, n_layers):
-    toks = [decode_tok(tokenizer, t) for t in answer_ids.tolist()]
+def report(tokenizer, answer_ids, probs, top_p, top_id, layer_indices, n_layers):
+    target_ids = answer_ids.tolist()
+    toks = [decode_tok(tokenizer, t) for t in target_ids]
     P = probs.tolist()
+    TP = top_p.tolist()
+    TID = top_id.tolist()
 
     layer_labels = []
     for j, li in enumerate(layer_indices):
         layer_labels.append(f"p(L{li})" if j == 0 else f"p@L{li}")
 
-    col_w = 9
+    # Each layer column is wide enough to optionally append "[top=p:'tok']".
+    col_w = 30
     hdr = f"{'idx':>3}  {'token':<16}" + "".join(
         f"{lab:>{col_w}}" for lab in layer_labels)
     print()
@@ -162,12 +177,19 @@ def report(tokenizer, answer_ids, probs, layer_indices, n_layers):
     for i, tok in enumerate(toks):
         row = f"{i:>3}  {repr(tok):<16}"
         for j in range(len(layer_indices)):
-            row += f"{P[i][j]:>{col_w}.3f}"
+            cell = f"{P[i][j]:.3f}"
+            # If the layer's argmax is NOT the target token, append the winner.
+            if TID[i][j] != target_ids[i]:
+                win_tok = decode_tok(tokenizer, TID[i][j])
+                cell += f" [{TP[i][j]:.3f}:{win_tok!r}]"
+            row += f"{cell:>{col_w}}"
         print(row)
     print()
     print(f"Layers sampled (of {n_layers}): "
           + ", ".join(f"L{li}" for li in layer_indices)
           + f"   [hidden_states idx; 0=embeddings, {n_layers}=final]")
+    print("Cell = p(target). If layer's top-1 != target, "
+          "[p:'tok'] of the layer's argmax is shown next to it.")
     print(f"Answer: {tokenizer.decode(answer_ids)!r}")
     print()
 
@@ -229,9 +251,10 @@ def main():
         n_layers = n_hs - 1
         layer_indices = pick_layers(n_hs, args.logit_len)
 
-        probs = logit_lens_probs(
+        probs, top_p, top_id = logit_lens_probs(
             model, prompt_ids, answer_ids, layer_indices, final_norm, lm_head)
-        report(tokenizer, answer_ids, probs, layer_indices, n_layers)
+        report(tokenizer, answer_ids, probs, top_p, top_id,
+               layer_indices, n_layers)
 
         if not args.loop:
             break
