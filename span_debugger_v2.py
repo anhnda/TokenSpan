@@ -94,16 +94,24 @@ def get_final_norm_and_head(model):
     return final_norm, lm_head
 
 
-def pick_layers(n_hidden_states, k):
+def pick_layers(n_hidden_states, k, only_last=False):
     """
     hidden_states has length n_layers+1 (index 0 = embeddings, last = final).
-    Sample k indices uniformly in linear space across [0, n_layers], always
-    including the final one. Returns indices sorted HIGH -> LOW so the final
-    layer prints first.
+
+    only_last=False (default): sample k indices uniformly in linear space
+        across [0, n_layers], always including the final layer.
+    only_last=True: take the top k layers counting back from the final one
+        (n_layers, n_layers-1, ...), since the relevant signal usually lives
+        in the last layers.
+
+    Returns indices sorted HIGH -> LOW so the final layer prints first.
     """
     last = n_hidden_states - 1
     if k <= 1:
         return [last]
+    if only_last:
+        lo = max(0, last - (k - 1))
+        return list(range(last, lo - 1, -1))   # last, last-1, ...
     raw = torch.linspace(0, last, steps=k).round().long().tolist()
     uniq = sorted(set(raw))
     if last not in uniq:
@@ -216,6 +224,9 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=80)
     ap.add_argument("--logit-len", type=int, default=5,
                     help="number of layers to sample (uniform in linear space)")
+    ap.add_argument("--only_last", action="store_true",
+                    help="pick the top --logit-len layers from the last "
+                         "backward (final, final-1, ...) instead of uniform")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--loop", action="store_true",
                     help="keep prompting for sentences until empty/EOF")
@@ -249,7 +260,7 @@ def main():
         with torch.no_grad():
             n_hs = len(model(full, output_hidden_states=True).hidden_states)
         n_layers = n_hs - 1
-        layer_indices = pick_layers(n_hs, args.logit_len)
+        layer_indices = pick_layers(n_hs, args.logit_len, args.only_last)
 
         probs, top_p, top_id = logit_lens_probs(
             model, prompt_ids, answer_ids, layer_indices, final_norm, lm_head)
