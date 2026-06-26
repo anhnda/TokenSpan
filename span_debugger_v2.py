@@ -209,21 +209,29 @@ def decode_tok(tokenizer, tid):
     return tokenizer.decode([tid])
 
 
-def report(tokenizer, answer_ids, probs, top_p, top_id, layer_indices, n_layers):
+def report(tokenizer, prompt_ids, answer_ids, probs, top_p, top_id,
+           sens, layer_indices, n_layers, use_logit):
+    """
+    One table per answer token, with prob (logit lens) and grad.embedding
+    sensitivity side by side for each selected layer.
+
+    For answer token i: prob is read at its prediction slot; the grad.embedding
+    sensitivity is taken at sequence position L+i (the answer token's own slot).
+    """
     target_ids = answer_ids.tolist()
     toks = [decode_tok(tokenizer, t) for t in target_ids]
     P = probs.tolist()
     TP = top_p.tolist()
     TID = top_id.tolist()
+    L = prompt_ids.numel()
+    S = sens.tolist()                            # [N, k], N = L+T
 
-    layer_labels = []
+    # interleaved column labels: p(L..) then g.e@L.. for each layer
+    p_w, g_w = 30, 13
+    hdr = f"{'idx':>3}  {'token':<16}"
     for j, li in enumerate(layer_indices):
-        layer_labels.append(f"p(L{li})" if j == 0 else f"p@L{li}")
-
-    # Each layer column is wide enough to optionally append "[top=p:'tok']".
-    col_w = 30
-    hdr = f"{'idx':>3}  {'token':<16}" + "".join(
-        f"{lab:>{col_w}}" for lab in layer_labels)
+        plab = f"p(L{li})" if j == 0 else f"p@L{li}"
+        hdr += f"{plab:>{p_w}}{('g.e@L'+str(li)):>{g_w}}"
     print()
     print(hdr)
     print("-" * len(hdr))
@@ -231,18 +239,21 @@ def report(tokenizer, answer_ids, probs, top_p, top_id, layer_indices, n_layers)
         row = f"{i:>3}  {repr(tok):<16}"
         for j in range(len(layer_indices)):
             cell = f"{P[i][j]:.3f}"
-            # If the layer's argmax is NOT the target token, append the winner.
             if TID[i][j] != target_ids[i]:
                 win_tok = decode_tok(tokenizer, TID[i][j])
                 cell += f" [{TP[i][j]:.3f}:{win_tok!r}]"
-            row += f"{cell:>{col_w}}"
+            row += f"{cell:>{p_w}}"
+            row += f"{S[L + i][j]:>{g_w}.4f}"     # sensitivity at answer slot L+i
         print(row)
     print()
+    scalar_kind = "sum logit(target)" if use_logit else "sum p(target)"
     print(f"Layers sampled (of {n_layers}): "
           + ", ".join(f"L{li}" for li in layer_indices)
           + f"   [hidden_states idx; 0=embeddings, {n_layers}=final]")
-    print("Cell = p(target). If layer's top-1 != target, "
-          "[p:'tok'] of the layer's argmax is shown next to it.")
+    print("p(...) = p(target) via logit lens; if layer top-1 != target, "
+          "[p:'tok'] of argmax shown.")
+    print(f"g.e@L  = grad x embedding sensitivity at the answer slot "
+          f"[scalar = {scalar_kind}].")
     print(f"Answer: {tokenizer.decode(answer_ids)!r}")
     print()
 
@@ -339,12 +350,11 @@ def main():
 
         probs, top_p, top_id = logit_lens_probs(
             model, prompt_ids, answer_ids, layer_indices, final_norm, lm_head)
-        report(tokenizer, answer_ids, probs, top_p, top_id,
-               layer_indices, n_layers)
-
         sens = gradxembed_sensitivity(
             model, prompt_ids, answer_ids, layer_indices,
             final_norm, lm_head, use_logit=args.logit)
+        report(tokenizer, prompt_ids, answer_ids, probs, top_p, top_id,
+               sens, layer_indices, n_layers, args.logit)
         report_sensitivity(tokenizer, prompt_ids, answer_ids, sens,
                            layer_indices, n_layers, args.logit)
 
