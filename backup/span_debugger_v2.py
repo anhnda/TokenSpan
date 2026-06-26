@@ -156,51 +156,6 @@ def logit_lens_probs(model, prompt_ids, answer_ids, layer_indices,
             torch.stack(top_id_cols, dim=1))
 
 
-def gradxembed_sensitivity(model, prompt_ids, answer_ids, layer_indices,
-                           final_norm, lm_head, use_logit=False):
-    """
-    grad x embedding sensitivity of each input-token hidden state to the
-    output. One forward pass WITH grad and output_hidden_states.
-
-    Scalar S = sum over answer tokens y_t of:
-        use_logit=False -> p(y_t)            (sum of output probabilities)
-        use_logit=True  -> logit(y_t)        (sum of output logits; no softmax,
-                                              avoids saturation)
-    where p/logit at slot t are read off the FINAL layer via the logit lens
-    (same head/norm as the model's real output).
-
-    For each selected layer L we then form  (dS/dh_L) . h_L  summed over the
-    hidden dim, giving one sensitivity scalar per sequence position.
-
-    Returns:
-        sens:  Tensor [N, k]   grad.embedding per position (rows) per layer
-                               (cols ordered as layer_indices), N = L+T
-    """
-    full = torch.cat([prompt_ids, answer_ids]).unsqueeze(0)
-    out = model(full, output_hidden_states=True)
-    hs = out.hidden_states                       # tuple, len = n_layers+1
-    L = prompt_ids.numel()
-    T = answer_ids.numel()
-    pos = torch.arange(L - 1, L - 1 + T, device=DEVICE)   # prediction slots
-
-    # scalar from the FINAL layer at the prediction slots
-    h_final = hs[-1][0, pos]                      # [T, d]
-    logits = lm_head(final_norm(h_final))         # [T, V]
-    tgt = logits.gather(1, answer_ids.unsqueeze(1)).squeeze(1)   # [T]
-    if use_logit:
-        scalar = tgt.sum()
-    else:
-        scalar = F.softmax(logits, dim=-1).gather(
-            1, answer_ids.unsqueeze(1)).squeeze(1).sum()
-
-    sel = [hs[li] for li in layer_indices]        # each [1, N, d], requires grad
-    grads = torch.autograd.grad(scalar, sel, retain_graph=False)
-    cols = []
-    for g, h in zip(grads, sel):
-        cols.append((g[0] * h[0]).sum(dim=-1))    # [N]  grad . embedding
-    return torch.stack(cols, dim=1)               # [N, k]
-
-
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -247,33 +202,6 @@ def report(tokenizer, answer_ids, probs, top_p, top_id, layer_indices, n_layers)
     print()
 
 
-def report_sensitivity(tokenizer, prompt_ids, answer_ids, sens,
-                       layer_indices, n_layers, use_logit):
-    """
-    Print grad.embedding per sequence position (input tokens + answer tokens).
-    """
-    seq_ids = torch.cat([prompt_ids, answer_ids]).tolist()
-    L = prompt_ids.numel()
-    S = sens.tolist()
-
-    layer_labels = [f"g.e@L{li}" for li in layer_indices]
-    col_w = 14
-    hdr = f"{'idx':>3}  {'pos':<5}{'token':<16}" + "".join(
-        f"{lab:>{col_w}}" for lab in layer_labels)
-    scalar_kind = "sum logit(target)" if use_logit else "sum p(target)"
-    print(f"grad x embedding sensitivity  [scalar = {scalar_kind}]")
-    print(hdr)
-    print("-" * len(hdr))
-    for i, tid in enumerate(seq_ids):
-        tag = "ans" if i >= L else "in"
-        tok = decode_tok(tokenizer, tid)
-        row = f"{i:>3}  {tag:<5}{repr(tok):<16}"
-        for j in range(len(layer_indices)):
-            row += f"{S[i][j]:>{col_w}.4f}"
-        print(row)
-    print()
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -300,9 +228,6 @@ def main():
                     help="pick the top --logit-len layers from the last "
                          "backward (final, final-1, ...) instead of uniform")
     ap.add_argument("--stdin", action="store_true")
-    ap.add_argument("--logit", action="store_true",
-                    help="grad.embedding scalar uses sum of output LOGITS "
-                         "instead of sum of probs (avoids softmax saturation)")
     ap.add_argument("--loop", action="store_true",
                     help="keep prompting for sentences until empty/EOF")
     args = ap.parse_args()
@@ -341,12 +266,6 @@ def main():
             model, prompt_ids, answer_ids, layer_indices, final_norm, lm_head)
         report(tokenizer, answer_ids, probs, top_p, top_id,
                layer_indices, n_layers)
-
-        sens = gradxembed_sensitivity(
-            model, prompt_ids, answer_ids, layer_indices,
-            final_norm, lm_head, use_logit=args.logit)
-        report_sensitivity(tokenizer, prompt_ids, answer_ids, sens,
-                           layer_indices, n_layers, args.logit)
 
         if not args.loop:
             break
