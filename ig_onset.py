@@ -125,13 +125,22 @@ def segment_ig(normf, head, h_start, h_end, target_id, n_steps):
 # stays >= threshold to the end.
 # ---------------------------------------------------------------------------
 
-def onset_layer(contribs_by_li, layer_order_low_to_high, threshold):
-    n = len(layer_order_low_to_high)
-    for start in range(n):
-        if all(contribs_by_li[layer_order_low_to_high[k]] >= threshold
-               for k in range(start, n)):
-            return layer_order_low_to_high[start]
-    return None
+def onset_mass(ig_map, layer_order_low_to_high, frac=0.5):
+    """
+    Earliest (low->high) layer at which cumulative |IG| reaches `frac` of the
+    total |IG| mass. Interpretation: 'the layer by which >=frac of the target
+    probability has been read out'. Small L* => decided early/easy; large L*
+    => decided late/hard. Parameter-free vs the old threshold rule.
+    """
+    tot = sum(abs(ig_map[li]) for li in layer_order_low_to_high)
+    if tot <= 0.0:
+        return layer_order_low_to_high[-1]
+    c = 0.0
+    for li in layer_order_low_to_high:
+        c += abs(ig_map[li])
+        if c / tot >= frac:
+            return li
+    return layer_order_low_to_high[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +194,7 @@ def run(model, tokenizer, sentence, args):
     print()
     print(f"Answer: {tokenizer.decode(answer_ids)!r}")
     print(f"baseline={args.baseline}  n_steps={args.n_steps}  "
-          f"target=prob  threshold={args.threshold}")
+          f"target=prob  onset_frac={args.onset_frac}")
     hdr = f"{'idx':>3}  {'token':<14}"
     for li in chosen_hi:
         hdr += f"{'IG@L'+str(li):>12}{'lens@L'+str(li):>12}"
@@ -222,7 +231,7 @@ def run(model, tokenizer, sentence, args):
         delta = f_final - f_base
         max_err = max(max_err, abs(total - delta))
 
-        Lstar = onset_layer(ig_map, chosen_lo, args.threshold)
+        Lstar = onset_mass(ig_map, chosen_lo, args.onset_frac)
 
         row = f"{t:>3}  {repr(tok):<14}"
         for li in chosen_hi:
@@ -238,6 +247,9 @@ def run(model, tokenizer, sentence, args):
           "f(h_L)-f(h_{prev chosen}); head=norm+lm_head applied ONCE.")
     print("sum over chosen layers == prob_i(final) - prob_i(baseline)  (Δprob).")
     print("lens@L = softmax(head(norm(h_L[i])))[y_t]  REFERENCE ONLY.")
+    print(f"onsetL* = earliest layer where cumulative |IG| reaches "
+          f"{args.onset_frac:.0%} of total mass (small=early/easy, "
+          f"large=late/hard).")
     print(f"Layers (hidden_states idx, 0=emb {n_layers}=final): "
           + ", ".join('L'+str(li) for li in chosen_lo))
     print()
@@ -268,6 +280,9 @@ def main():
                     help="IG interpolation steps PER SEGMENT")
     ap.add_argument("--baseline", choices=["zero", "mean"], default="mean")
     ap.add_argument("--threshold", type=float, default=0.0)
+    ap.add_argument("--onset-frac", type=float, default=0.5,
+                    help="onset L* = earliest layer where cumulative |IG| "
+                         "reaches this fraction of total mass")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--loop", action="store_true")
     args = ap.parse_args()
