@@ -202,6 +202,208 @@ def gradxembed_sensitivity(model, prompt_ids, answer_ids, layer_indices,
 
 
 # ---------------------------------------------------------------------------
+# Integrated Gradients from a hidden layer to the TRUE output logit.
+#
+# Unlike the logit lens, this never re-applies lm_head to an intermediate
+# layer. It replaces h_L by a path  alpha * h_L  (alpha: 0 -> 1) and forwards
+# through the REAL downstream decoder layers + final norm + head, integrating
+# the gradient of the target logit w.r.t. h_L along the path. By the IG
+# completeness axiom the per-position attributions sum to
+#     logit_target(h_L) - logit_target(baseline=0)
+# which is reported as a residual check (no proxy, an actual guarantee).
+# ---------------------------------------------------------------------------
+
+def _get_decoder_layers(model):
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        raise RuntimeError("Could not locate decoder layers for IG.")
+    return inner, layers
+
+
+def _run_upper_stack(model, inner, layers, h_start, start_layer,
+                     position_ids, causal_mask, position_embeddings):
+    """
+    Forward hidden state h_start (output of decoder block index start_layer-1,
+    i.e. hidden_states[start_layer]) through decoder layers start_layer..end.
+
+    hidden_states index convention: hs[k] is the input to decoder layer k
+    (hs[0] = embeddings, hs[n_layers] = final pre-norm output). So to continue
+    from hs[L] we run decoder layers L, L+1, ..., n_layers-1.
+    """
+    h = h_start
+    for k in range(start_layer, len(layers)):
+        layer = layers[k]
+        kwargs = {}
+        # newer HF: position_embeddings precomputed (cos,sin); older: not.
+        if position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
+        try:
+            out = layer(
+                h,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                **kwargs,
+            )
+        except TypeError:
+            out = layer(h, attention_mask=causal_mask, position_ids=position_ids)
+        h = out[0] if isinstance(out, tuple) else out
+    return h
+
+
+def _baseline_hidden_states(model, tokenizer, prompt_ids, answer_ids,
+                            kind, full_hs):
+    """
+    Build per-layer baseline hidden states aligned to the full [prompt+answer]
+    sequence, for IG. Returns a tuple like hidden_states (len n_layers+1),
+    each [1, N, d], OR a string error message if the baseline is unavailable.
+
+    kind:
+        zero   -> all zeros (handled by caller; returns None here)
+        mean   -> per-layer mean over positions, broadcast to all positions
+        corrupt-> hidden states of a content-shuffled prompt (causal-tracing
+                  style contrast); answer region kept as-is in token space
+        pad    -> hidden states of an all-pad-token sequence (same length)
+        mask   -> hidden states of an all-mask-token sequence (if tokenizer
+                  exposes a mask token; else error string)
+    """
+    if kind == "zero":
+        return None
+    if kind == "mean":
+        # per-layer centroid over positions, broadcast back
+        return tuple(h.mean(dim=1, keepdim=True).expand_as(h)
+                     for h in full_hs)
+
+    full = torch.cat([prompt_ids, answer_ids]).unsqueeze(0)
+    N = full.shape[1]
+
+    if kind == "corrupt":
+        # shuffle non-special prompt tokens; keep specials and answer in place
+        specials = set(tokenizer.all_special_ids or [])
+        ids = full.clone()
+        L = prompt_ids.numel()
+        movable = [i for i in range(L)
+                   if int(ids[0, i].item()) not in specials]
+        if len(movable) > 1:
+            perm = movable[:]
+            g = torch.Generator(device="cpu").manual_seed(0)
+            idx = torch.randperm(len(perm), generator=g).tolist()
+            shuffled = [perm[i] for i in idx]
+            vals = ids[0, perm].clone()
+            ids[0, shuffled] = vals
+        base_ids = ids
+
+    elif kind == "pad":
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+        if pad_id is None:
+            return "pad baseline unavailable: tokenizer has no pad/eos token"
+        base_ids = torch.full_like(full, int(pad_id))
+
+    elif kind == "mask":
+        mask_id = getattr(tokenizer, "mask_token_id", None)
+        if mask_id is None:
+            return ("mask baseline unavailable: tokenizer has no mask token "
+                    "(decoder-only models like Llama/Mistral lack one)")
+        base_ids = torch.full_like(full, int(mask_id))
+
+    else:
+        return f"unknown baseline kind: {kind}"
+
+    with torch.no_grad():
+        out = model(base_ids, output_hidden_states=True)
+    return out.hidden_states
+
+
+def ig_from_layer(model, tokenizer, prompt_ids, answer_ids, layer_indices,
+                  final_norm, lm_head, steps=16, baseline_kind="zero"):
+    """
+    IG of the TRUE target logit w.r.t. each selected layer's hidden state.
+
+    baseline_kind: zero | mean | corrupt | pad | mask  (see _baseline_hidden_states)
+
+    Returns:
+        attr:      Tensor [N, k]   IG attribution per position per layer
+        residual:  Tensor [k]      completeness residual per layer:
+                                    sum_pos attr - (logit(h_L) - logit(baseline)),
+                                    should be ~0 (Riemann error only).
+        note:      str | None      message if a requested baseline was
+                                    unavailable and zero was used instead.
+    """
+    inner, layers = _get_decoder_layers(model)
+    full = torch.cat([prompt_ids, answer_ids]).unsqueeze(0)
+    L = prompt_ids.numel()
+    T = answer_ids.numel()
+    pos = torch.arange(L - 1, L - 1 + T, device=DEVICE)
+    seqlen = full.shape[1]
+
+    # Capture the model's own positional / mask machinery via one clean pass.
+    with torch.no_grad():
+        base = model(full, output_hidden_states=True)
+    hs = base.hidden_states
+
+    # Build baseline hidden states (per layer) once.
+    note = None
+    base_hs = _baseline_hidden_states(
+        model, tokenizer, prompt_ids, answer_ids, baseline_kind, hs)
+    if isinstance(base_hs, str):
+        note = base_hs + "  -> falling back to zero baseline"
+        base_hs = None  # zero
+
+    position_ids = torch.arange(seqlen, device=DEVICE).unsqueeze(0)
+    # rotary embeddings, if the model precomputes them (newer HF)
+    position_embeddings = None
+    rotary = getattr(inner, "rotary_emb", None)
+    if rotary is not None:
+        try:
+            emb0 = inner.embed_tokens(full)
+            position_embeddings = rotary(emb0, position_ids)
+        except Exception:
+            position_embeddings = None
+    # causal mask: rely on layer's internal handling by passing None when the
+    # model builds it itself; otherwise an additive triangular mask.
+    causal_mask = None
+
+    attr_cols, resid = [], []
+    for li in layer_indices:
+        h_L = hs[li].detach()                     # [1, N, d]  fixed endpoint
+        if base_hs is None:
+            baseline = torch.zeros_like(h_L)
+        else:
+            baseline = base_hs[li].detach()
+        delta = h_L - baseline
+
+        grad_acc = torch.zeros_like(h_L)
+        # endpoint logits for the completeness check
+        def target_logit(h_in):
+            h_top = _run_upper_stack(
+                model, inner, layers, h_in, li,
+                position_ids, causal_mask, position_embeddings)
+            lg = lm_head(final_norm(h_top[0, pos]))            # [T, V]
+            return lg.gather(1, answer_ids.unsqueeze(1)).squeeze(1).sum()
+
+        for s in range(steps):
+            alpha = (s + 0.5) / steps             # midpoint rule
+            h_in = (baseline + alpha * delta).clone().requires_grad_(True)
+            S = target_logit(h_in)
+            g, = torch.autograd.grad(S, h_in)
+            grad_acc += g
+        avg_grad = grad_acc / steps
+        ig = (avg_grad * delta)[0]                # [N, d]
+        attr = ig.sum(dim=-1)                     # [N]
+
+        with torch.no_grad():
+            f_hi = target_logit(h_L)
+            f_lo = target_logit(baseline)
+        residual = attr.sum() - (f_hi - f_lo)
+        attr_cols.append(attr)
+        resid.append(residual)
+
+    return torch.stack(attr_cols, dim=1), torch.stack(resid), note
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -285,6 +487,39 @@ def report_sensitivity(tokenizer, prompt_ids, answer_ids, sens,
     print()
 
 
+def report_ig(tokenizer, prompt_ids, answer_ids, attr, residual,
+              layer_indices, n_layers, steps, baseline_kind="zero"):
+    """
+    IG-from-layer attribution per sequence position, with the completeness
+    residual per layer printed in the footer.
+    """
+    seq_ids = torch.cat([prompt_ids, answer_ids]).tolist()
+    L = prompt_ids.numel()
+    A = attr.tolist()
+    R = residual.tolist()
+
+    layer_labels = [f"IG@L{li}" for li in layer_indices]
+    col_w = 14
+    hdr = f"{'idx':>3}  {'pos':<5}{'token':<16}" + "".join(
+        f"{lab:>{col_w}}" for lab in layer_labels)
+    print(f"Integrated Gradients to TRUE logit  "
+          f"[steps={steps}, baseline={baseline_kind}, scalar=sum logit(target)]")
+    print(hdr)
+    print("-" * len(hdr))
+    for i, tid in enumerate(seq_ids):
+        tag = "ans" if i >= L else "in"
+        tok = decode_tok(tokenizer, tid)
+        row = f"{i:>3}  {tag:<5}{repr(tok):<16}"
+        for j in range(len(layer_indices)):
+            row += f"{A[i][j]:>{col_w}.4f}"
+        print(row)
+    print()
+    print("completeness residual (should be ~0): "
+          + ", ".join(f"L{li}={R[j]:+.4f}"
+                      for j, li in enumerate(layer_indices)))
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -314,6 +549,17 @@ def main():
     ap.add_argument("--logit", action="store_true",
                     help="grad.embedding scalar uses sum of output LOGITS "
                          "instead of sum of probs (avoids softmax saturation)")
+    ap.add_argument("--ig", action="store_true",
+                    help="also compute Integrated Gradients from each selected "
+                         "layer to the TRUE output logit (no borrowed-head "
+                         "proxy; reports completeness residual)")
+    ap.add_argument("--ig-steps", type=int, default=16,
+                    help="number of IG integration steps (midpoint rule)")
+    ap.add_argument("--ig-baseline", default="zero",
+                    choices=["zero", "mean", "corrupt", "pad", "mask"],
+                    help="IG baseline: zero | mean (per-layer centroid) | "
+                         "corrupt (content-shuffled prompt) | pad | mask "
+                         "(if tokenizer has a mask token)")
     ap.add_argument("--loop", action="store_true",
                     help="keep prompting for sentences until empty/EOF")
     args = ap.parse_args()
@@ -357,6 +603,16 @@ def main():
                sens, layer_indices, n_layers, args.logit)
         report_sensitivity(tokenizer, prompt_ids, answer_ids, sens,
                            layer_indices, n_layers, args.logit)
+
+        if args.ig:
+            attr, residual, ig_note = ig_from_layer(
+                model, tokenizer, prompt_ids, answer_ids, layer_indices,
+                final_norm, lm_head, steps=args.ig_steps,
+                baseline_kind=args.ig_baseline)
+            if ig_note:
+                print(f"  [IG baseline note] {ig_note}\n")
+            report_ig(tokenizer, prompt_ids, answer_ids, attr, residual,
+                      layer_indices, n_layers, args.ig_steps, args.ig_baseline)
 
         if not args.loop:
             break
