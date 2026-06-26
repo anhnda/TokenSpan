@@ -121,52 +121,6 @@ def segment_ig(normf, head, h_start, h_end, target_id, n_steps):
 
 
 # ---------------------------------------------------------------------------
-# Batched segment IG: all (token, segment, step) interpolation points in ONE
-# backward, chunked to bound VRAM. Equivalent to calling segment_ig for every
-# (t, segment); each interpolation point passes through f independently
-# (f = norm+head is pointwise on a single hidden vector, no cross-token path),
-# so grad(p.sum()) over the flat batch yields the per-point gradient exactly.
-# Returns ig[T, K]: ig[t, j] is the IG credited to chosen_lo[j] for token t.
-# ---------------------------------------------------------------------------
-
-def segment_ig_batched(normf, head, starts, ends, target_ids, n_steps,
-                       max_rows=4096):
-    """
-    starts, ends: [T, K, d]   target_ids: [T] (long)
-    Returns ig: [T, K] on CPU-friendly float (same value as segment_ig).
-    max_rows caps how many interpolation points go through head() at once,
-    to keep the [rows, vocab] logits tensor within VRAM.
-    """
-    T, K, d = starts.shape
-    device = starts.device
-    diff = ends - starts                                  # [T, K, d]
-    a = (torch.arange(n_steps, device=device) + 0.5) / n_steps   # [n]
-
-    # all interpolation points: [T, K, n, d] -> flat [T*K*n, d]
-    pts = starts[:, :, None, :] + a[None, None, :, None] * diff[:, :, None, :]
-    flat = pts.reshape(-1, d)                              # [N, d], N=T*K*n
-    N = flat.size(0)
-
-    # per-row target id, aligned with the flattening order (t, j, s)
-    tgt_full = (target_ids[:, None, None]
-                .expand(T, K, n_steps).reshape(-1))        # [N]
-
-    grad_flat = torch.empty_like(flat)
-    for lo in range(0, N, max_rows):
-        hi = min(lo + max_rows, N)
-        leaf = flat[lo:hi].detach().requires_grad_(True)   # [b, d]
-        logp = F.log_softmax(head(normf(leaf)), dim=-1)    # [b, V]
-        rows = torch.arange(hi - lo, device=device)
-        p = logp[rows, tgt_full[lo:hi]].exp()              # prob, [b]
-        g, = torch.autograd.grad(p.sum(), leaf)            # block-diag -> per-row
-        grad_flat[lo:hi] = g.detach()
-
-    grad_mean = grad_flat.reshape(T, K, n_steps, d).mean(2)   # [T, K, d]
-    ig = (diff * grad_mean).sum(-1)                           # [T, K]
-    return ig
-
-
-# ---------------------------------------------------------------------------
 # Onset extraction (unchanged semantics): earliest layer whose contribution
 # stays >= threshold to the end.
 # ---------------------------------------------------------------------------
@@ -248,51 +202,33 @@ def run(model, tokenizer, sentence, args):
     print(hdr)
     print("-" * len(hdr))
 
-    K = len(chosen_lo)
-
-    # --- build the chains for ALL tokens at once -------------------------
-    # ends[t, j]   = h_{chosen_lo[j]}[position_t]
-    # starts[t, j] = base_t            if j == 0
-    #              = ends[t, j-1]      otherwise
-    H = torch.stack([hs[li][0] for li in chosen_lo], dim=0)   # [K, S, d]
-    positions = pos_slots.to(H.device)
-    ends = H[:, positions, :].permute(1, 0, 2).contiguous()   # [T, K, d]
-
-    base_vecs = torch.stack(
-        [baseline_vec(chosen_lo[0], int(p.item())) for p in pos_slots],
-        dim=0).to(H.device)                                    # [T, d]
-
-    starts = torch.empty_like(ends)
-    starts[:, 0, :] = base_vecs
-    if K > 1:
-        starts[:, 1:, :] = ends[:, :-1, :]
-
-    target_ids = answer_ids.to(H.device).long()                # [T]
-
-    # --- one batched backward for every (token, segment) ----------------
-    ig_all = segment_ig_batched(
-        normf, head, starts, ends, target_ids, args.n_steps)   # [T, K]
-
-    # completeness references f(h_final) and f(base), per token, no-grad
-    with torch.no_grad():
-        f_final_all = F.softmax(head(normf(ends[:, -1, :])), dim=-1)
-        f_final_all = f_final_all[torch.arange(T), target_ids]      # [T]
-        f_base_all = F.softmax(head(normf(base_vecs)), dim=-1)
-        f_base_all = f_base_all[torch.arange(T), target_ids]        # [T]
-
     max_err = 0.0
     for t in range(T):
         position = int(pos_slots[t].item())
         target_id = int(answer_ids[t].item())
         tok = tokenizer.decode([target_id])
 
-        ig_map = {li: float(ig_all[t, j].item())
-                  for j, li in enumerate(chosen_lo)}
+        # build the chain: baseline -> h_{chosen[0]} -> ... -> h_{final}
+        lo0 = chosen_lo[0]
+        base = baseline_vec(lo0, position)
+
+        # node hidden vectors along the chain
+        nodes = [base] + [hs[li][0, position].detach() for li in chosen_lo]
+        # segment j (j=0..k-1) goes nodes[j] -> nodes[j+1] and is CREDITED to
+        # layer chosen_lo[j].
+        ig_map = {}
+        for j, li in enumerate(chosen_lo):
+            ig_map[li] = segment_ig(
+                normf, head, nodes[j], nodes[j + 1], target_id, args.n_steps)
 
         lens_map = {li: lens_p(li, position, target_id) for li in chosen_lo}
 
+        # completeness check: sum == f(h_final) - f(base)
+        with torch.no_grad():
+            f_final = f_prob(normf, head, nodes[-1], target_id).item()
+            f_base = f_prob(normf, head, base, target_id).item()
         total = sum(ig_map.values())
-        delta = float(f_final_all[t].item() - f_base_all[t].item())
+        delta = f_final - f_base
         max_err = max(max_err, abs(total - delta))
 
         Lstar = onset_mass(ig_map, chosen_lo, args.onset_frac)
