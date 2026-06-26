@@ -229,6 +229,18 @@ def run(model, tokenizer, sentence, args):
 
     layers = get_decoder_layers(model)
 
+    # final norm + lm_head, used ONLY to compute reference logit-lens values
+    inner = getattr(model, "model", model)
+    lens_norm = getattr(inner, "norm", None) or getattr(inner, "final_layernorm")
+    lens_head = getattr(model, "lm_head", None) or getattr(model, "embed_out")
+
+    @torch.no_grad()
+    def lens_p(li, position, target_id):
+        """Reference only: softmax(lm_head(norm(h_L[i])))[y_t]. NOT used for onset."""
+        h = hs[li][0, position]
+        logits = lens_head(lens_norm(h.unsqueeze(0))).squeeze(0)
+        return F.softmax(logits, dim=-1)[target_id].item()
+
     # which hidden_states indices to probe
     if args.layers:
         li_list = sorted(set(int(x) for x in args.layers))
@@ -264,13 +276,7 @@ def run(model, tokenizer, sentence, args):
             grad_accum += g.detach()
         grad_mean = grad_accum / args.n_steps
         ig = torch.dot(diff, grad_mean).item()
-
-        # grad*input contrast: gradient at the true h_L, dot same displacement
-        h1 = h_L.clone().detach().requires_grad_(True)
-        logit1 = f_of_h(li, h1, position, target_id)
-        g1, = torch.autograd.grad(logit1, h1)
-        gxi = torch.dot(diff, g1.detach()).item()
-        return ig, gxi
+        return ig
 
     pos_slots = torch.arange(Lp - 1, Lp - 1 + T)   # prediction slots
 
@@ -284,7 +290,7 @@ def run(model, tokenizer, sentence, args):
           f"threshold={args.threshold}")
     hdr = f"{'idx':>3}  {'token':<14}"
     for li in li_sorted_hi:
-        hdr += f"{'IG@L'+str(li):>12}{'gxi@L'+str(li):>12}"
+        hdr += f"{'IG@L'+str(li):>12}{'lens@L'+str(li):>12}"
     hdr += f"{'onset L*':>10}"
     print(hdr)
     print("-" * len(hdr))
@@ -294,25 +300,24 @@ def run(model, tokenizer, sentence, args):
         target_id = int(answer_ids[t].item())
         tok = tokenizer.decode([target_id])
 
-        ig_map, gxi_map = {}, {}
+        ig_map, lens_map = {}, {}
         for li in li_list:
-            ig, gxi = ig_for(li, position, target_id)
-            ig_map[li] = ig
-            gxi_map[li] = gxi
+            ig_map[li] = ig_for(li, position, target_id)
+            lens_map[li] = lens_p(li, position, target_id)
 
         Lstar = onset_layer(ig_map, li_sorted_lo, args.threshold)
 
         row = f"{t:>3}  {repr(tok):<14}"
         for li in li_sorted_hi:
-            row += f"{ig_map[li]:>12.3f}{gxi_map[li]:>12.3f}"
+            row += f"{ig_map[li]:>12.3f}{lens_map[li]:>12.3f}"
         row += f"{(str(Lstar) if Lstar is not None else '-'):>10}"
         print(row)
 
     print()
     print("IG@L  = <h_L[i]-baseline, mean grad of final logit(y_t) over path>  "
           "(signed, logit units; head used ONCE at the end).")
-    print("gxi@L = <h_L[i]-baseline, grad at true h_L> (raw grad*input; ~0 when "
-          "saturated -> that's why IG).")
+    print("lens@L= softmax(lm_head(norm(h_L[i])))[y_t]  REFERENCE ONLY (borrows "
+          "final head on lower layers; not used for onset).")
     print("onset L* = earliest layer whose IG stays >= threshold to the end "
           "(small=easy/early, large=hard/late).")
     print(f"Layers (hidden_states idx, 0=emb {n_layers}=final): "
