@@ -106,8 +106,30 @@ def capture_hidden_states(model, full_ids):
     return out.hidden_states
 
 
+def _score_from_logits(logits, target_id, mode):
+    """
+    logits: [V] final logits. Reduce to the scalar IG target.
+      mode='prob'   : softmax(logits)[y_t]            (default; lens-like)
+      mode='logit'  : raw logit[y_t]                  (--logit)
+      mode='logprob': log_softmax(logits)[y_t]        (--target logprob)
+      mode='gap'    : logit[y_t] - max_{v!=y_t} logit (--target gap)
+    """
+    if mode == "logit":
+        return logits[target_id]
+    if mode == "prob":
+        return F.softmax(logits, dim=-1)[target_id]
+    if mode == "logprob":
+        return F.log_softmax(logits, dim=-1)[target_id]
+    if mode == "gap":
+        masked = logits.clone()
+        masked[target_id] = float("-inf")
+        runner = masked.max()
+        return logits[target_id] - runner
+    raise ValueError(f"unknown score mode {mode!r}")
+
+
 def final_logit_from_hidden(model, hs_layer, layer_idx, full_ids, position,
-                            target_id):
+                            target_id, mode="prob"):
     """
     Run the tail of the network starting from the residual stream AT THE OUTPUT
     of block `layer_idx` (i.e. hidden_states[layer_idx+1] semantics), with the
@@ -137,7 +159,7 @@ def final_logit_from_hidden(model, hs_layer, layer_idx, full_ids, position,
         lm_head = getattr(model, "lm_head", None) or getattr(model, "embed_out")
         h = hs_layer  # [d]
         logits = lm_head(normf(h.unsqueeze(0))).squeeze(0)  # [V]
-        return logits[target_id]
+        return _score_from_logits(logits, target_id, mode)
 
     consumer = layers[li]
     handle_box = {}
@@ -155,7 +177,7 @@ def final_logit_from_hidden(model, hs_layer, layer_idx, full_ids, position,
     try:
         out = model(full_ids)  # full forward; hook injects at consumer input
         logits = out.logits[0, position]  # [V]
-        return logits[target_id]
+        return _score_from_logits(logits, target_id, mode)
     finally:
         handle_box["h"].remove()
 
@@ -256,10 +278,10 @@ def run(model, tokenizer, sentence, args):
         # mean over sequence positions at this layer
         return hs[li][0].mean(dim=0).detach()
 
-    # closure: final logit of target as fn of injected h at hidden idx li
+    # closure: final score of target as fn of injected h at hidden idx li
     def f_of_h(li, h_vec, position, target_id):
         return final_logit_from_hidden(
-            model, h_vec, li, full, position, target_id)
+            model, h_vec, li, full, position, target_id, mode=args.target)
 
     def ig_for(li, position, target_id):
         h_L = hs[li][0, position].detach()
@@ -287,7 +309,7 @@ def run(model, tokenizer, sentence, args):
     print()
     print(f"Answer: {tokenizer.decode(answer_ids)!r}")
     print(f"baseline={args.baseline}  n_steps={args.n_steps}  "
-          f"threshold={args.threshold}")
+          f"target={args.target}  threshold={args.threshold}")
     hdr = f"{'idx':>3}  {'token':<14}"
     for li in li_sorted_hi:
         hdr += f"{'IG@L'+str(li):>12}{'lens@L'+str(li):>12}"
@@ -314,8 +336,9 @@ def run(model, tokenizer, sentence, args):
         print(row)
 
     print()
-    print("IG@L  = <h_L[i]-baseline, mean grad of final logit(y_t) over path>  "
-          "(signed, logit units; head used ONCE at the end).")
+    print("IG@L  = <h_L[i]-baseline, mean grad of final TARGET(y_t) over path>  "
+          "(signed; units follow --target: prob in [0,1], logit/logprob/gap in "
+          "logit units; head used ONCE at the end).")
     print("lens@L= softmax(lm_head(norm(h_L[i])))[y_t]  REFERENCE ONLY (borrows "
           "final head on lower layers; not used for onset).")
     print("onset L* = earliest layer whose IG stays >= threshold to the end "
@@ -349,11 +372,19 @@ def main():
     ap.add_argument("--n-steps", type=int, default=16,
                     help="IG interpolation steps")
     ap.add_argument("--baseline", choices=["zero", "mean"], default="mean")
+    ap.add_argument("--target", choices=["prob", "logit", "logprob", "gap"],
+                    default="prob",
+                    help="IG target scalar: prob (default, lens-like), logit, "
+                         "logprob, or gap(y_t vs runner-up)")
+    ap.add_argument("--logit", action="store_true",
+                    help="shortcut for --target logit (overrides --target)")
     ap.add_argument("--threshold", type=float, default=0.0,
                     help="onset: IG must stay >= this from L* to the end")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--loop", action="store_true")
     args = ap.parse_args()
+    if args.logit:
+        args.target = "logit"
 
     print(f"Loading {args.model} on {DEVICE} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
