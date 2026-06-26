@@ -403,6 +403,68 @@ def ig_from_layer(model, tokenizer, prompt_ids, answer_ids, layer_indices,
     return torch.stack(attr_cols, dim=1), torch.stack(resid), note
 
 
+def stability_panel(model, prompt_ids, answer_ids, layer_indices,
+                    final_norm, lm_head, target_idx=0):
+    """
+    Proxy-free stability / responsiveness panel. No lm_head on inner layers.
+
+    For ONE target answer token y_{target_idx}, read at its prediction slot,
+    with scalar = its TRUE logit (single logit, not a sum):
+
+      drift[i, L]   = 1 - cos(h_L[i], h_final[i])
+                      intrinsic representational convergence of position i:
+                      small  -> representation already settled by layer L
+                      large  -> still being rewritten in upper layers
+
+      relsens[i, L] = ||d logit_target / d h_L[i]|| * ||h_L[i]|| / |logit_target|
+                      dimensionless output responsiveness:
+                      fractional change in the target logit per fractional
+                      change in this token's layer-L representation.
+                      small  -> output insensitive here (stable / irrelevant)
+                      large  -> output still swings with this token (unstable /
+                                load-bearing)
+
+    Returns:
+        drift:   Tensor [N, k]
+        relsens: Tensor [N, k]
+        tgt_tok: int   the answer token id that was attributed
+    """
+    full = torch.cat([prompt_ids, answer_ids]).unsqueeze(0)
+    L = prompt_ids.numel()
+    T = answer_ids.numel()
+    target_idx = max(0, min(target_idx, T - 1))
+    slot = L - 1 + target_idx                      # prediction slot of target
+    tgt_id = int(answer_ids[target_idx].item())
+
+    out = model(full, output_hidden_states=True)
+    hs = out.hidden_states                         # len n_layers+1, each [1,N,d]
+    h_final = hs[-1][0]                            # [N, d]
+
+    # scalar = the single TRUE target logit
+    logit_vec = lm_head(final_norm(hs[-1][0, slot:slot + 1]))[0]   # [V]
+    target_logit = logit_vec[tgt_id]
+    denom = target_logit.detach().abs().clamp_min(1e-6)
+
+    sel = [hs[li] for li in layer_indices]
+    grads = torch.autograd.grad(target_logit, sel, retain_graph=False)
+
+    drift_cols, rel_cols = [], []
+    cos = torch.nn.functional.cosine_similarity
+    for g, h, li in zip(grads, sel, layer_indices):
+        hL = h[0]                                  # [N, d]
+        # drift: 1 - cos(h_L, h_final), per position
+        d = 1.0 - cos(hL, h_final, dim=-1)         # [N]
+        # relsens: ||g|| * ||h|| / |logit|, per position
+        gnorm = g[0].norm(dim=-1)                  # [N]
+        hnorm = hL.norm(dim=-1)                     # [N]
+        rs = gnorm * hnorm / denom                  # [N]
+        drift_cols.append(d.detach())
+        rel_cols.append(rs.detach())
+    return (torch.stack(drift_cols, dim=1),
+            torch.stack(rel_cols, dim=1),
+            tgt_id)
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -520,6 +582,41 @@ def report_ig(tokenizer, prompt_ids, answer_ids, attr, residual,
     print()
 
 
+def report_stability(tokenizer, prompt_ids, answer_ids, drift, relsens,
+                     layer_indices, n_layers, tgt_id, target_idx):
+    """
+    Proxy-free stability panel: drift (1-cos to final) and relsens
+    (dimensionless output responsiveness) side by side per layer.
+    """
+    seq_ids = torch.cat([prompt_ids, answer_ids]).tolist()
+    L = prompt_ids.numel()
+    D = drift.tolist()
+    RS = relsens.tolist()
+
+    d_w, r_w = 11, 12
+    hdr = f"{'idx':>3}  {'pos':<5}{'token':<16}"
+    for li in layer_indices:
+        hdr += f"{('drift@L'+str(li)):>{d_w}}{('rsens@L'+str(li)):>{r_w}}"
+    tgt_tok = decode_tok(tokenizer, tgt_id)
+    print(f"stability panel  [target = answer tok #{target_idx} "
+          f"{tgt_tok!r}; drift=1-cos(h_L,h_final); "
+          f"rsens=||g||*||h||/|logit|, proxy-free]")
+    print(hdr)
+    print("-" * len(hdr))
+    for i, tid in enumerate(seq_ids):
+        tag = "ans" if i >= L else "in"
+        tok = decode_tok(tokenizer, tid)
+        row = f"{i:>3}  {tag:<5}{repr(tok):<16}"
+        for j in range(len(layer_indices)):
+            row += f"{D[i][j]:>{d_w}.4f}{RS[i][j]:>{r_w}.4f}"
+        print(row)
+    print()
+    print("read: low drift + low rsens = settled & irrelevant; "
+          "low drift + high rsens = decided early but load-bearing; "
+          "high drift + high rsens = still actively shaping the output.")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -560,6 +657,13 @@ def main():
                     help="IG baseline: zero | mean (per-layer centroid) | "
                          "corrupt (content-shuffled prompt) | pad | mask "
                          "(if tokenizer has a mask token)")
+    ap.add_argument("--stability", action="store_true",
+                    help="proxy-free stability panel: drift (1-cos to final) "
+                         "and rsens (||g||*||h||/|logit|) per layer, single "
+                         "target logit, no inner-layer head")
+    ap.add_argument("--stab-target", type=int, default=0,
+                    help="answer-token index to attribute for --stability "
+                         "(default 0 = first answer token)")
     ap.add_argument("--loop", action="store_true",
                     help="keep prompting for sentences until empty/EOF")
     args = ap.parse_args()
@@ -613,6 +717,13 @@ def main():
                 print(f"  [IG baseline note] {ig_note}\n")
             report_ig(tokenizer, prompt_ids, answer_ids, attr, residual,
                       layer_indices, n_layers, args.ig_steps, args.ig_baseline)
+
+        if args.stability:
+            drift, relsens, tgt_id = stability_panel(
+                model, prompt_ids, answer_ids, layer_indices,
+                final_norm, lm_head, target_idx=args.stab_target)
+            report_stability(tokenizer, prompt_ids, answer_ids, drift, relsens,
+                             layer_indices, n_layers, tgt_id, args.stab_target)
 
         if not args.loop:
             break
