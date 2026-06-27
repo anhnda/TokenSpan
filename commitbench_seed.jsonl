@@ -1,0 +1,47 @@
+# CommitBench — seed set (design discussion + starter data)
+#
+# KHÔNG phải benchmark đầy đủ. Đây là seed để (a) chốt schema, (b) cấp đúng vài
+# cặp cho P0 smoke test. Mở rộng thành benchmark là P2, CHỈ sau khi P0 dương.
+#
+# Mỗi instance:
+#   id        : định danh
+#   suite     : agreement | binding | factual | relational
+#   x_plus    : clean prompt (kết thúc ngay trước prediction position q)
+#   x_minus   : counterfactual, KHÁC x_plus đúng ở source span
+#   y_plus    : clean answer (PHẢI single-token với tokenizer của model)
+#   y_minus   : foil answer  (PHẢI single-token)
+#   source    : annotated source span I (chuỗi con trong x_plus quyết định answer)
+#   notes     : ràng buộc cần verify per-model
+#
+# 4 RÀNG BUỘC (mọi cặp phải thỏa):
+#   C1 prompt khác đúng 1 factor (= source span)
+#   C2 answer contrast đổi đoán được giữa hai prompt
+#   C3 prediction position aligned (cùng số token tới q)  ← verify bằng tokenizer
+#   C4 source span biết by construction
+#
+# LƯU Ý TOKENIZER: single-token + alignment phải kiểm bằng chính tokenizer của
+# model trước khi dùng. Các cặp dưới chọn để KHẢ NĂNG CAO thỏa với Llama-3/GPT-2
+# (answer là từ thường, ngắn), nhưng vẫn phải filter thật.
+
+# ---- SUITE: factual recall ----
+# contrast = đổi subject entity, answer = thuộc tính (thủ đô / ngôn ngữ ...)
+{"id": "fact-001", "suite": "factual", "x_plus": "The capital of France is", "x_minus": "The capital of Germany is", "y_plus": " Paris", "y_minus": " Berlin", "source": "France", "notes": "Paris/Berlin thường single-token; độ dài prompt bằng nhau (France/Germany cùng 1 từ)."}
+{"id": "fact-002", "suite": "factual", "x_plus": "The capital of Italy is", "x_minus": "The capital of Spain is", "y_plus": " Rome", "y_minus": " Madrid", "source": "Italy", "notes": "verify Rome/Madrid single-token."}
+{"id": "fact-003", "suite": "factual", "x_plus": "The capital of Japan is", "x_minus": "The capital of China is", "y_plus": " Tokyo", "y_minus": " Beijing", "source": "Japan", "notes": "Beijing có thể >1 token tùy tokenizer — KIỂM."}
+{"id": "fact-004", "suite": "factual", "x_plus": "The currency of Japan is the", "x_minus": "The currency of Britain is the", "y_plus": " yen", "y_minus": " pound", "source": "Japan", "notes": "answer là common noun, khả năng cao single-token."}
+
+# ---- SUITE: agreement ----
+# contrast = số của chủ ngữ chính, GIỮ distractor noun chen giữa, answer = is/are
+{"id": "agr-001", "suite": "agreement", "x_plus": "The key to the cabinets", "x_minus": "The keys to the cabinets", "y_plus": " is", "y_minus": " are", "source": "key", "notes": "distractor 'cabinets' số nhiều cố tình gài. is/are single-token. Độ dài: key/keys khác 1 token? 'keys' có thể tách → KIỂM alignment."}
+{"id": "agr-002", "suite": "agreement", "x_plus": "The author of the books", "x_minus": "The authors of the books", "y_plus": " is", "y_minus": " are", "source": "author", "notes": "cùng vấn đề author/authors alignment."}
+{"id": "agr-003", "suite": "agreement", "x_plus": "The dog near the children", "x_minus": "The dogs near the children", "y_plus": " is", "y_minus": " are", "source": "dog", "notes": "distractor 'children' số nhiều."}
+
+# ---- SUITE: entity binding (IOI-style) ----
+# contrast = đổi tên giữ vai, answer = tên người nhận
+{"id": "bind-001", "suite": "binding", "x_plus": "When Mary and John went to the store, John gave a drink to", "x_minus": "When Mary and John went to the store, Mary gave a drink to", "y_plus": " Mary", "y_minus": " John", "source": "John gave", "notes": "IOI cổ điển. source = subject của 'gave' quyết định IO. tên 1 token. ĐỘ DÀI BẰNG NHAU (chỉ đổi John<->Mary)."}
+{"id": "bind-002", "suite": "binding", "x_plus": "After Anna and Tom finished, Tom handed the keys to", "x_minus": "After Anna and Tom finished, Anna handed the keys to", "y_plus": " Anna", "y_minus": " Tom", "source": "Tom handed", "notes": "verify Anna/Tom single-token."}
+
+# ---- SUITE: relational composition ----
+# contrast = đổi 1 quan hệ trong câu nhiều bước, answer = hướng/đối tượng
+{"id": "rel-001", "suite": "relational", "x_plus": "Box A is to the left of box B, so box B is to the", "x_minus": "Box A is to the right of box B, so box B is to the", "y_plus": " right", "y_minus": " left", "source": "left of box B", "notes": "đảo quan hệ phải suy ngược. left/right single-token. ĐỘ DÀI bằng (left/right khác token-len? KIỂM)."}
+{"id": "rel-002", "suite": "relational", "x_plus": "Tom is older than Sam, so Sam is", "x_minus": "Tom is younger than Sam, so Sam is", "y_plus": " younger", "y_minus": " older", "source": "older than Sam", "notes": "older/younger có thể multi-token — KIỂM kỹ, có thể phải bỏ cặp này."}
