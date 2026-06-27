@@ -1,0 +1,17 @@
+# commitbench_pairs.jsonl — cặp cho batch P0, MỖI cặp kèm placebo CÙNG KHUNG.
+# placebo = prompt cùng độ dài, cùng template, nhưng nội dung vô can với answer.
+# Bài học: placebo lạ ("A wooden chair") làm off-manifold bẩn -> KL giả cao.
+# Placebo cùng khung -> KL nhỏ -> đo sạch.
+#
+# QUAN TRỌNG: alignment (cùng số token) và single-token answer PHẢI verify bằng
+# tokenizer. Chạy verify_commitbench.py trước, hoặc xem [warn]/[skip] khi batch chạy.
+
+# ---- binding (IOI) — kỳ vọng G>0 (readout < commit) ----
+{"id": "bind-mary", "suite": "binding", "x_plus": "When Mary and John went to the store, John gave a drink to", "x_minus": "When Mary and John went to the store, Mary gave a drink to", "y_plus": " Mary", "y_minus": " John", "x_placebo": "When Mary and John went to the store, they walked right over to"}
+{"id": "bind-anna", "suite": "binding", "x_plus": "After Anna and Tom finished lunch, Tom handed the keys to", "x_minus": "After Anna and Tom finished lunch, Anna handed the keys to", "y_plus": " Anna", "y_minus": " Tom", "x_placebo": "After Anna and Tom finished lunch, they slowly walked towards"}
+{"id": "bind-sara", "suite": "binding", "x_plus": "While Sara and Paul were talking, Paul passed the note to", "x_minus": "While Sara and Paul were talking, Sara passed the note to", "y_plus": " Sara", "y_minus": " Paul", "x_placebo": "While Sara and Paul were talking, someone quietly knocked on the"}
+
+# ---- factual recall — kỳ vọng G~0 (readout = commit) ----
+{"id": "fact-france", "suite": "factual", "x_plus": "The capital of France is", "x_minus": "The capital of Germany is", "y_plus": " Paris", "y_minus": " Berlin", "x_placebo": "The weather in summer is"}
+{"id": "fact-italy", "suite": "factual", "x_plus": "The capital of Italy is", "x_minus": "The capital of Spain is", "y_plus": " Rome", "y_minus": " Madrid", "x_placebo": "The weather in winter is"}
+{"id": "fact-japan", "suite": "factual", "x_plus": "The capital of Japan is", "x_minus": "The capital of Korea is", "y_plus": " Tokyo", "y_minus": " Seoul", "x_placebo": "The weather this morning is"}
